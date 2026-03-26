@@ -100,6 +100,12 @@ class TrainConfig:
     wandb_run_name: str | None = None
     wandb_mode: str = "online"
     ddp_find_unused_parameters: bool = False
+    lora_enabled: bool = False
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.0
+    lora_bias: str = "none"
+    lora_target_modules: str = "diffusion_attn"
     seed: int = 0
 
 

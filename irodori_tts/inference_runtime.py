@@ -17,6 +17,7 @@ from safetensors.torch import load_file as load_safetensors_file
 
 from .codec import DACVAECodec, patchify_latent, unpatchify_latent
 from .config import ModelConfig
+from .lora import checkpoint_state_uses_lora
 from .model import TextToLatentRFDiT
 from .rf import sample_euler_rf_cfg
 from .text_normalization import normalize_text
@@ -293,6 +294,10 @@ def _load_checkpoint_from_pt(path: Path) -> tuple[dict[str, torch.Tensor], dict,
     if train_cfg is not None and not isinstance(train_cfg, dict):
         raise ValueError(f"Checkpoint train_config must be a dictionary when present: {path}")
 
+    if checkpoint_state_uses_lora(model_state):
+        raise ValueError(
+            f"LoRA checkpoints must be loaded from adapter directories or merged safetensors: {path}"
+        )
     return model_state, model_cfg, _extract_inference_train_config(train_cfg)
 
 

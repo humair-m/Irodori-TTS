@@ -19,6 +19,7 @@ For model weights and audio samples, please refer to the [model card](https://hu
 - **Flow Matching TTS**: Rectified Flow Diffusion Transformer (RF-DiT) over continuous DACVAE latents
 - **Voice Cloning**: Zero-shot voice cloning from reference audio
 - **Multi-GPU Training**: Distributed training via `uv run torchrun` with gradient accumulation, mixed precision (bf16), and W&B logging
+- **PEFT LoRA Fine-Tuning**: Parameter-efficient adaptation with PEFT/LoRA for released checkpoints
 - **Flexible Inference**: CLI, Gradio Web UI, and HuggingFace Hub checkpoint support
 
 ## Architecture
@@ -190,9 +191,36 @@ uv run python train.py \
   --init-checkpoint path/to/Irodori-TTS-500M-v2.safetensors
 ```
 
+LoRA fine-tuning:
+
+```bash
+uv run python train.py \
+  --config configs/train_500m_v2_lora.yaml \
+  --manifest data/train_manifest.jsonl \
+  --output-dir outputs/irodori_tts_lora \
+  --init-checkpoint path/to/Irodori-TTS-500M-v2.safetensors
+```
+
+Available LoRA target presets:
+
+- `text_attn_mlp`: text encoder attention + attention gate + MLP
+- `speaker_attn_mlp`: speaker encoder attention + attention gate + MLP, plus `speaker_encoder.in_proj`
+- `diffusion_attn`: diffusion attention only, including text/speaker context KV and attention gate
+- `diffusion_attn_mlp`: `diffusion_attn` + diffusion MLP
+- `all_attn`: all attention blocks across text/speaker/diffusion, including attention gates
+- `diffusion_full`: diffusion stack broadly: `cond_module`, `in_proj/out_proj`, diffusion attention, diffusion MLP, and AdaLN
+- `adaln`: diffusion-block AdaLN layers only
+- `conditioning`: conditioning-side projections only: `cond_module`, `speaker_encoder.in_proj`, and diffusion context KV projections
+- `all_attn_mlp`: `all_attn` + text/speaker/diffusion MLP, plus `speaker_encoder.in_proj`
+- `all_linear`: all `nn.Linear` layers in the model; embeddings and norm weights are not included
+
+`--lora-target-modules` also accepts a regex string or a comma-separated list of module suffixes. Resume automatically restores the saved LoRA config from the training checkpoint unless you explicitly override it.
+
+When `--lora` is enabled, checkpoints are saved as adapter-only directories containing PEFT adapter weights plus trainer state for resume.
+
 #### Resuming Interrupted Training
 
-Resume an existing training run from a training checkpoint (`.pt`). This restores model, optimizer, scheduler, and step state.
+Resume an existing training run from a training checkpoint. Full-model runs use `.pt`; LoRA runs use checkpoint directories. Both restore optimizer, scheduler, and step state.
 
 ```bash
 uv run python train.py \
@@ -202,6 +230,18 @@ uv run python train.py \
   --resume outputs/irodori_tts/checkpoint_0010000.pt
 ```
 
+LoRA resume example:
+
+```bash
+uv run python train.py \
+  --config configs/train_500m_v2_lora.yaml \
+  --manifest data/train_manifest.jsonl \
+  --output-dir outputs/irodori_tts_lora \
+  --resume outputs/irodori_tts_lora/checkpoint_0010000
+```
+
+If you move a LoRA checkpoint to another environment and the original base-checkpoint path is no longer valid, pass `--init-checkpoint path/to/base_model.safetensors` together with `--resume` to override the saved base-model path.
+
 ### 3. Checkpoint Conversion
 
 Convert a training checkpoint to inference-only safetensors format:
@@ -209,6 +249,14 @@ Convert a training checkpoint to inference-only safetensors format:
 ```bash
 uv run python convert_checkpoint_to_safetensors.py outputs/checkpoint_final.pt
 ```
+
+LoRA adapter checkpoints can also be converted directly:
+
+```bash
+uv run python convert_checkpoint_to_safetensors.py outputs/irodori_tts_lora/checkpoint_final
+```
+
+LoRA adapter checkpoints are merged into the base model automatically during conversion, so the exported `.safetensors` file is directly usable for inference.
 
 ## Project Structure
 
@@ -228,12 +276,14 @@ Irodori-TTS/
 │   ├── tokenizer.py            # Pretrained LLM tokenizer wrapper
 │   ├── config.py               # Model / Train / Sampling config dataclasses
 │   ├── inference_runtime.py    # Cached, thread-safe inference runtime
+│   ├── lora.py                 # PEFT LoRA integration helpers
 │   ├── text_normalization.py   # Japanese text normalization
 │   ├── optim.py                # Muon + AdamW optimizer
 │   └── progress.py             # Training progress tracker
 │
 └── configs/
     ├── train_500m_v2.yaml       # 500M v2 model config
+    ├── train_500m_v2_lora.yaml  # 500M v2 LoRA fine-tuning config
     ├── train_500m.yaml          # 500M v1 model config
     └── train_2.5b.yaml          # 2.5B parameter model config
 ```

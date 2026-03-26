@@ -21,6 +21,7 @@ from datasets import Audio, load_dataset
 from tqdm import tqdm
 
 from irodori_tts.codec import DACVAECodec
+from irodori_tts.text_normalization import normalize_text
 
 
 def _coerce_text(value: Any) -> str:
@@ -188,6 +189,8 @@ def _prepare_example(
 ) -> _PreparedItem:
     try:
         text = _coerce_text(sample.get(args.text_column, ""))
+        if args.text_normalize:
+            text = normalize_text(text)
         text = text.strip()
 
         if not text:
@@ -750,6 +753,15 @@ def main() -> None:
     )
     parser.add_argument("--audio-column", required=True, help="Audio column name")
     parser.add_argument("--text-column", required=True, help="Text column name")
+    parser.add_argument(
+        "--text-normalize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Apply irodori_tts text normalization before writing manifest text. "
+            "Use --no-text-normalize to keep raw text."
+        ),
+    )
     parser.add_argument(
         "--speaker-column",
         action="append",

@@ -6,6 +6,7 @@ import json
 import os
 import random
 import re
+import shutil
 import sys
 from contextlib import nullcontext
 from dataclasses import asdict, replace
@@ -24,6 +25,17 @@ from irodori_tts.config import (
     merge_dataclass_overrides,
 )
 from irodori_tts.dataset import LatentTextDataset, TTSCollator
+from irodori_tts.lora import (
+    LORA_METADATA_NAME,
+    LORA_TARGET_PRESETS,
+    LORA_TRAIN_CONFIG_FIELDS,
+    LORA_TRAINER_STATE_NAME,
+    apply_lora,
+    count_parameters,
+    is_lora_adapter_dir,
+    load_lora_adapter,
+    train_config_uses_lora,
+)
 from irodori_tts.model import TextToLatentRFDiT
 from irodori_tts.optim import build_optimizer, build_scheduler, current_lr
 from irodori_tts.progress import TrainProgress
@@ -36,8 +48,10 @@ from irodori_tts.rf import (
 from irodori_tts.tokenizer import PretrainedTextTokenizer
 
 WANDB_MODES = {"online", "offline", "disabled"}
-CHECKPOINT_STEP_RE = re.compile(r"^checkpoint_(\d+)\.pt$")
-CHECKPOINT_BEST_VAL_LOSS_RE = re.compile(r"^checkpoint_best_val_loss_(\d+)_(-?\d+(?:\.\d+)?)\.pt$")
+CHECKPOINT_STEP_RE = re.compile(r"^checkpoint_(\d+)(?:\.pt)?$")
+CHECKPOINT_BEST_VAL_LOSS_RE = re.compile(
+    r"^checkpoint_best_val_loss_(\d+)_(-?\d+(?:\.\d+)?)(?:\.pt)?$"
+)
 SAFETENSORS_CONFIG_META_KEY = "config_json"
 
 
@@ -73,14 +87,43 @@ def echo_style_masked_mse(
 
 def save_checkpoint(
     path: str | Path,
-    model: TextToLatentRFDiT,
+    model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler,
     step: int,
     model_cfg: ModelConfig,
     train_cfg: TrainConfig,
+    *,
+    base_init: dict | None = None,
 ) -> None:
     path = Path(path)
+    if train_config_uses_lora(train_cfg):
+        if path.exists():
+            _safe_unlink(path)
+        path.mkdir(parents=True, exist_ok=True)
+        if not hasattr(model, "save_pretrained"):
+            raise RuntimeError(
+                "LoRA checkpoint saving requires a PEFT model with save_pretrained()."
+            )
+        model.save_pretrained(path)
+        dump_configs(path / "config.json", model_cfg, train_cfg)
+        (path / LORA_METADATA_NAME).write_text(
+            json.dumps({"base_init": base_init}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        torch.save(
+            {
+                "step": step,
+                "optimizer": optimizer.state_dict(),
+                "scheduler": None if scheduler is None else scheduler.state_dict(),
+                "model_config": asdict(model_cfg),
+                "train_config": asdict(train_cfg),
+                "base_init": base_init,
+            },
+            path / LORA_TRAINER_STATE_NAME,
+        )
+        return
+
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -97,14 +140,17 @@ def save_checkpoint(
 
 def _safe_unlink(path: Path) -> None:
     try:
-        path.unlink()
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
     except FileNotFoundError:
         return
 
 
 def list_periodic_checkpoints(output_dir: Path) -> list[tuple[int, Path]]:
     checkpoints: list[tuple[int, Path]] = []
-    for path in output_dir.glob("checkpoint_*.pt"):
+    for path in output_dir.glob("checkpoint_*"):
         match = CHECKPOINT_STEP_RE.match(path.name)
         if match is None:
             continue
@@ -123,7 +169,7 @@ def enforce_periodic_checkpoint_limit(output_dir: Path, keep_count: int) -> None
 
 def list_best_val_loss_checkpoints(output_dir: Path) -> list[tuple[float, int, Path]]:
     checkpoints: list[tuple[float, int, Path]] = []
-    for path in output_dir.glob("checkpoint_best_val_loss_*.pt"):
+    for path in output_dir.glob("checkpoint_best_val_loss_*"):
         match = CHECKPOINT_BEST_VAL_LOSS_RE.match(path.name)
         if match is None:
             continue
@@ -154,11 +200,12 @@ def maybe_save_best_val_loss_checkpoint(
     keep_best_n: int,
     val_loss: float,
     step: int,
-    model: TextToLatentRFDiT,
+    model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler,
     model_cfg: ModelConfig,
     train_cfg: TrainConfig,
+    base_init: dict | None,
 ) -> tuple[list[tuple[float, int, Path]], Path | None]:
     if keep_best_n <= 0:
         return checkpoints, None
@@ -177,7 +224,7 @@ def maybe_save_best_val_loss_checkpoint(
         kept.append((score, saved_step, path))
     checkpoints = kept
 
-    path = output_dir / f"checkpoint_best_val_loss_{step:07d}_{val_loss:.6f}.pt"
+    path = _best_checkpoint_path(output_dir, step=step, val_loss=val_loss, train_cfg=train_cfg)
     save_checkpoint(
         path=path,
         model=model,
@@ -186,6 +233,7 @@ def maybe_save_best_val_loss_checkpoint(
         step=step,
         model_cfg=model_cfg,
         train_cfg=train_cfg,
+        base_init=base_init,
     )
     checkpoints.append((float(val_loss), int(step), path))
     checkpoints = prune_best_val_loss_checkpoints(checkpoints, keep_best_n)
@@ -194,6 +242,26 @@ def maybe_save_best_val_loss_checkpoint(
 
 def cli_provided(argv: list[str], flag: str) -> bool:
     return any(x == flag or x.startswith(flag + "=") for x in argv)
+
+
+def _periodic_checkpoint_path(output_dir: Path, step: int, train_cfg: TrainConfig) -> Path:
+    if train_config_uses_lora(train_cfg):
+        return output_dir / f"checkpoint_{step:07d}"
+    return output_dir / f"checkpoint_{step:07d}.pt"
+
+
+def _best_checkpoint_path(
+    output_dir: Path, *, step: int, val_loss: float, train_cfg: TrainConfig
+) -> Path:
+    if train_config_uses_lora(train_cfg):
+        return output_dir / f"checkpoint_best_val_loss_{step:07d}_{val_loss:.6f}"
+    return output_dir / f"checkpoint_best_val_loss_{step:07d}_{val_loss:.6f}.pt"
+
+
+def _final_checkpoint_path(output_dir: Path, train_cfg: TrainConfig) -> Path:
+    if train_config_uses_lora(train_cfg):
+        return output_dir / "checkpoint_final"
+    return output_dir / "checkpoint_final.pt"
 
 
 def build_text_tokenizer(
@@ -290,7 +358,9 @@ def initialize_text_embedding_from_pretrained(
     del text_backbone
 
 
-def _load_model_state_from_checkpoint(path: Path) -> tuple[dict[str, torch.Tensor], dict | None]:
+def _load_model_state_from_checkpoint(
+    path: Path,
+) -> tuple[dict[str, torch.Tensor], dict | None, dict | None]:
     if path.suffix.lower() == ".safetensors":
         from safetensors import safe_open
         from safetensors.torch import load_file as load_safetensors_file
@@ -303,7 +373,7 @@ def _load_model_state_from_checkpoint(path: Path) -> tuple[dict[str, torch.Tenso
             parsed = json.loads(config_json)
             if isinstance(parsed, dict):
                 checkpoint_model_cfg = parsed
-        return load_safetensors_file(str(path), device="cpu"), checkpoint_model_cfg
+        return load_safetensors_file(str(path), device="cpu"), checkpoint_model_cfg, None
 
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(payload, dict):
@@ -318,7 +388,10 @@ def _load_model_state_from_checkpoint(path: Path) -> tuple[dict[str, torch.Tenso
     checkpoint_model_cfg = payload.get("model_config")
     if checkpoint_model_cfg is not None and not isinstance(checkpoint_model_cfg, dict):
         raise ValueError(f"Checkpoint model_config must be a dictionary when present: {path}")
-    return raw_model, checkpoint_model_cfg
+    checkpoint_train_cfg = payload.get("train_config")
+    if checkpoint_train_cfg is not None and not isinstance(checkpoint_train_cfg, dict):
+        raise ValueError(f"Checkpoint train_config must be a dictionary when present: {path}")
+    return raw_model, checkpoint_model_cfg, checkpoint_train_cfg
 
 
 def _check_model_config_compatibility(
@@ -339,6 +412,134 @@ def _check_model_config_compatibility(
                 f"Checkpoint/config mismatch for '{key}': checkpoint={checkpoint_value} "
                 f"current={current_value} ({checkpoint_path})"
             )
+
+
+def _load_checkpoint_payload(path: str | Path, *, map_location) -> dict:
+    checkpoint_path = Path(path)
+    if checkpoint_path.is_dir():
+        state_path = checkpoint_path / LORA_TRAINER_STATE_NAME
+        payload = torch.load(state_path, map_location=map_location, weights_only=True)
+    else:
+        payload = torch.load(checkpoint_path, map_location=map_location, weights_only=True)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Checkpoint payload must be a dictionary, got {type(payload)!r}.")
+    return payload
+
+
+def _normalize_checkpoint_path(path: str | Path) -> Path:
+    return Path(os.path.abspath(str(Path(path).expanduser())))
+
+
+def _lora_field_cli_explicit(field: str, args: argparse.Namespace, raw_argv: list[str]) -> bool:
+    if field == "lora_enabled":
+        return args.lora_enabled is not None
+    flag = "--" + field.replace("_", "-")
+    return cli_provided(raw_argv, flag)
+
+
+def _restore_resume_lora_config(
+    train_cfg: TrainConfig,
+    *,
+    resume_train_cfg: dict | None,
+    args: argparse.Namespace,
+    raw_argv: list[str],
+    exp_cfg: dict,
+) -> TrainConfig:
+    if not isinstance(resume_train_cfg, dict):
+        return train_cfg
+
+    train_overrides = exp_cfg.get("train", {})
+    if not isinstance(train_overrides, dict):
+        train_overrides = {}
+
+    updates: dict[str, object] = {}
+    for field in LORA_TRAIN_CONFIG_FIELDS:
+        if field not in resume_train_cfg:
+            continue
+        explicit = _lora_field_cli_explicit(field, args, raw_argv) or field in train_overrides
+        current_value = getattr(train_cfg, field)
+        resume_value = resume_train_cfg[field]
+        if explicit:
+            if current_value != resume_value:
+                raise ValueError(
+                    f"Resume checkpoint expects train.{field}={resume_value!r}, "
+                    f"but current config requests {current_value!r}."
+                )
+            continue
+        updates[field] = resume_value
+
+    if updates:
+        train_cfg = replace(train_cfg, **updates)
+    return train_cfg
+
+
+def _initialize_base_model_from_pretrained_embeddings(
+    raw_model: torch.nn.Module,
+    *,
+    model_cfg: ModelConfig,
+    distributed: bool,
+    is_main_process: bool,
+) -> None:
+    if distributed:
+        if is_main_process:
+            print(
+                f"Initializing text embedding from pretrained model: {model_cfg.text_tokenizer_repo}"
+            )
+            initialize_text_embedding_from_pretrained(
+                raw_model,
+                model_cfg,
+                local_files_only=False,
+            )
+        dist.barrier()
+        if not is_main_process:
+            initialize_text_embedding_from_pretrained(
+                raw_model,
+                model_cfg,
+                local_files_only=True,
+            )
+        dist.barrier()
+        return
+
+    if is_main_process:
+        print(f"Initializing text embedding from pretrained model: {model_cfg.text_tokenizer_repo}")
+    initialize_text_embedding_from_pretrained(
+        raw_model,
+        model_cfg,
+        local_files_only=False,
+    )
+
+
+def _apply_base_initialization(
+    raw_model: torch.nn.Module,
+    *,
+    model_cfg: ModelConfig,
+    base_init: dict | None,
+    distributed: bool,
+    is_main_process: bool,
+) -> None:
+    mode = None if base_init is None else base_init.get("mode")
+    if mode is None:
+        _initialize_base_model_from_pretrained_embeddings(
+            raw_model,
+            model_cfg=model_cfg,
+            distributed=distributed,
+            is_main_process=is_main_process,
+        )
+        return
+
+    if mode == "checkpoint":
+        checkpoint_path = base_init.get("checkpoint_path")
+        if not isinstance(checkpoint_path, str) or not checkpoint_path:
+            raise ValueError("LoRA checkpoint metadata is missing base_init.checkpoint_path.")
+        init_path = _normalize_checkpoint_path(checkpoint_path)
+        init_state, init_model_cfg, _ = _load_model_state_from_checkpoint(init_path)
+        _check_model_config_compatibility(init_path, init_model_cfg, model_cfg)
+        raw_model.load_state_dict(init_state)
+        if is_main_process:
+            print(f"Initialized model weights from: {init_path}")
+        return
+
+    raise ValueError(f"Unsupported base_init mode: {mode!r}")
 
 
 def resolve_dist_env() -> tuple[int, int, int]:
@@ -536,7 +737,7 @@ def main() -> None:
     parser.add_argument(
         "--resume",
         default=None,
-        help="Resume full training state from a training checkpoint (.pt).",
+        help="Resume full training state from a training checkpoint (.pt or LoRA checkpoint dir).",
     )
     parser.add_argument(
         "--init-checkpoint",
@@ -680,6 +881,42 @@ def main() -> None:
         default=None,
         help="Weights & Biases mode.",
     )
+    lora_group = parser.add_mutually_exclusive_group()
+    lora_group.add_argument(
+        "--lora",
+        dest="lora_enabled",
+        action="store_true",
+        help="Enable PEFT LoRA fine-tuning.",
+    )
+    lora_group.add_argument(
+        "--no-lora",
+        dest="lora_enabled",
+        action="store_false",
+        help="Disable PEFT LoRA fine-tuning.",
+    )
+    parser.set_defaults(lora_enabled=None)
+    parser.add_argument("--lora-r", type=int, default=None, help="LoRA rank.")
+    parser.add_argument("--lora-alpha", type=int, default=None, help="LoRA alpha scaling.")
+    parser.add_argument(
+        "--lora-dropout",
+        type=float,
+        default=None,
+        help="LoRA dropout probability.",
+    )
+    parser.add_argument(
+        "--lora-bias",
+        choices=["none", "all", "lora_only"],
+        default=None,
+        help="Bias handling passed to PEFT LoRA.",
+    )
+    parser.add_argument(
+        "--lora-target-modules",
+        default=None,
+        help=(
+            "LoRA target preset, regex, or comma-separated module suffix list. "
+            f"Presets: {', '.join(sorted(LORA_TARGET_PRESETS))}."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=0)
     ddp_group = parser.add_mutually_exclusive_group()
     ddp_group.add_argument(
@@ -699,11 +936,9 @@ def main() -> None:
     )
     parser.set_defaults(ddp_find_unused_parameters=None)
     args = parser.parse_args()
-    if args.resume is not None and args.init_checkpoint is not None:
-        raise ValueError("--resume and --init-checkpoint are mutually exclusive.")
     if args.resume is not None and Path(args.resume).suffix.lower() == ".safetensors":
         raise ValueError(
-            "--resume expects a training checkpoint (.pt). "
+            "--resume expects a training checkpoint (.pt or LoRA checkpoint dir). "
             "Use --init-checkpoint for inference-only .safetensors weights."
         )
 
@@ -806,6 +1041,18 @@ def main() -> None:
         train_cfg = replace(train_cfg, wandb_run_name=args.wandb_run_name)
     if cli_provided(raw_argv, "--wandb-mode"):
         train_cfg = replace(train_cfg, wandb_mode=args.wandb_mode)
+    if args.lora_enabled is not None:
+        train_cfg = replace(train_cfg, lora_enabled=args.lora_enabled)
+    if cli_provided(raw_argv, "--lora-r"):
+        train_cfg = replace(train_cfg, lora_r=args.lora_r)
+    if cli_provided(raw_argv, "--lora-alpha"):
+        train_cfg = replace(train_cfg, lora_alpha=args.lora_alpha)
+    if cli_provided(raw_argv, "--lora-dropout"):
+        train_cfg = replace(train_cfg, lora_dropout=args.lora_dropout)
+    if cli_provided(raw_argv, "--lora-bias"):
+        train_cfg = replace(train_cfg, lora_bias=args.lora_bias)
+    if cli_provided(raw_argv, "--lora-target-modules"):
+        train_cfg = replace(train_cfg, lora_target_modules=args.lora_target_modules)
     if args.ddp_find_unused_parameters is not None:
         train_cfg = replace(
             train_cfg,
@@ -813,6 +1060,27 @@ def main() -> None:
         )
     if cli_provided(raw_argv, "--seed"):
         train_cfg = replace(train_cfg, seed=args.seed)
+
+    resume_path = Path(args.resume).expanduser() if args.resume is not None else None
+    resume_train_cfg = None
+    resume_base_init = None
+    if args.resume is not None:
+        resume_meta = _load_checkpoint_payload(resume_path, map_location="cpu")
+        raw_resume_train_cfg = resume_meta.get("train_config")
+        if raw_resume_train_cfg is not None and not isinstance(raw_resume_train_cfg, dict):
+            raise ValueError("Resume checkpoint train_config must be a dictionary when present.")
+        resume_train_cfg = raw_resume_train_cfg
+        raw_resume_base_init = resume_meta.get("base_init")
+        if raw_resume_base_init is not None and not isinstance(raw_resume_base_init, dict):
+            raise ValueError("Resume checkpoint base_init must be a dictionary when present.")
+        resume_base_init = raw_resume_base_init
+        train_cfg = _restore_resume_lora_config(
+            train_cfg,
+            resume_train_cfg=resume_train_cfg,
+            args=args,
+            raw_argv=raw_argv,
+            exp_cfg=exp_cfg,
+        )
 
     if cli_provided(raw_argv, "--latent-dim"):
         model_cfg = replace(model_cfg, latent_dim=args.latent_dim)
@@ -1063,43 +1331,86 @@ def main() -> None:
                 f"Checkpoint retention: validation disabled, keep latest {periodic_checkpoint_keep} periodic checkpoints."
             )
 
-    raw_model = TextToLatentRFDiT(model_cfg).to(device)
-    if args.resume is None and args.init_checkpoint is None:
-        if distributed:
-            if is_main_process:
-                print(
-                    f"Initializing text embedding from pretrained model: {model_cfg.text_tokenizer_repo}"
-                )
-                initialize_text_embedding_from_pretrained(
-                    raw_model,
-                    model_cfg,
-                    local_files_only=False,
-                )
-            dist.barrier()
-            if not is_main_process:
-                initialize_text_embedding_from_pretrained(
-                    raw_model,
-                    model_cfg,
-                    local_files_only=True,
-                )
-            dist.barrier()
-        else:
-            if is_main_process:
-                print(
-                    f"Initializing text embedding from pretrained model: {model_cfg.text_tokenizer_repo}"
-                )
-            initialize_text_embedding_from_pretrained(
-                raw_model,
-                model_cfg,
-                local_files_only=False,
+    if not (0.0 <= train_cfg.lora_dropout <= 1.0):
+        raise ValueError(f"lora_dropout must be in [0, 1], got {train_cfg.lora_dropout}")
+    if train_cfg.lora_r <= 0:
+        raise ValueError(f"lora_r must be > 0, got {train_cfg.lora_r}")
+    if train_cfg.lora_alpha <= 0:
+        raise ValueError(f"lora_alpha must be > 0, got {train_cfg.lora_alpha}")
+
+    if args.resume is not None:
+        if train_config_uses_lora(train_cfg):
+            if resume_path is None or not is_lora_adapter_dir(resume_path):
+                raise ValueError("LoRA resume expects an adapter checkpoint directory.")
+        elif resume_path is not None and resume_path.is_dir():
+            raise ValueError(
+                "Non-LoRA resume expects a .pt training checkpoint, not a checkpoint directory."
             )
+        if args.init_checkpoint is not None and not train_config_uses_lora(train_cfg):
+            raise ValueError(
+                "--resume and --init-checkpoint can only be combined for LoRA adapter resumes."
+            )
+
+    if train_config_uses_lora(train_cfg) and args.resume is None and args.init_checkpoint is None:
+        raise ValueError(
+            "LoRA fine-tuning requires --init-checkpoint for the base model, "
+            "or --resume from a LoRA adapter checkpoint directory."
+        )
+
+    raw_model: torch.nn.Module = TextToLatentRFDiT(model_cfg).to(device)
+    lora_wrapped = False
+    base_init: dict | None = None
+    if args.resume is not None and train_config_uses_lora(train_cfg):
+        base_init = resume_base_init
+        if args.init_checkpoint is not None:
+            override_init_path = _normalize_checkpoint_path(args.init_checkpoint)
+            base_init = {"mode": "checkpoint", "checkpoint_path": str(override_init_path)}
+        _apply_base_initialization(
+            raw_model,
+            model_cfg=model_cfg,
+            base_init=base_init,
+            distributed=distributed,
+            is_main_process=is_main_process,
+        )
+        if resume_path is None or not is_lora_adapter_dir(resume_path):
+            raise ValueError("LoRA resume expects an adapter checkpoint directory.")
+        raw_model = load_lora_adapter(raw_model, resume_path, is_trainable=True)
+        lora_wrapped = True
+    elif args.resume is None and args.init_checkpoint is None:
+        _apply_base_initialization(
+            raw_model,
+            model_cfg=model_cfg,
+            base_init=None,
+            distributed=distributed,
+            is_main_process=is_main_process,
+        )
+        if train_config_uses_lora(train_cfg):
+            raw_model = apply_lora(raw_model, train_cfg)
+            lora_wrapped = True
     elif args.init_checkpoint is not None:
-        init_checkpoint_path = Path(args.init_checkpoint).expanduser()
-        init_state, init_model_cfg = _load_model_state_from_checkpoint(init_checkpoint_path)
-        _check_model_config_compatibility(init_checkpoint_path, init_model_cfg, model_cfg)
-        raw_model.load_state_dict(init_state)
-        if is_main_process:
-            print(f"Initialized model weights from: {init_checkpoint_path}")
+        init_checkpoint_path = _normalize_checkpoint_path(args.init_checkpoint)
+        base_init = {"mode": "checkpoint", "checkpoint_path": str(init_checkpoint_path)}
+        _apply_base_initialization(
+            raw_model,
+            model_cfg=model_cfg,
+            base_init=base_init,
+            distributed=distributed,
+            is_main_process=is_main_process,
+        )
+        if train_config_uses_lora(train_cfg) and not lora_wrapped:
+            raw_model = apply_lora(raw_model, train_cfg)
+            lora_wrapped = True
+
+    if train_config_uses_lora(train_cfg) and is_main_process:
+        trainable_params, total_params = count_parameters(raw_model)
+        print(
+            "LoRA enabled: "
+            f"r={train_cfg.lora_r} alpha={train_cfg.lora_alpha} "
+            f"dropout={train_cfg.lora_dropout:.3f} "
+            f"target_modules={train_cfg.lora_target_modules!r} "
+            f"trainable={trainable_params:,}/{total_params:,}"
+        )
+
     train_model = raw_model
     if train_cfg.compile_model:
         if not hasattr(torch, "compile"):
@@ -1154,8 +1465,9 @@ def main() -> None:
     step = 0
     progress: TrainProgress | None = None
     if args.resume is not None:
-        ckpt = torch.load(args.resume, map_location=device, weights_only=True)
-        raw_model.load_state_dict(ckpt["model"])
+        ckpt = _load_checkpoint_payload(resume_path, map_location=device)
+        if not train_config_uses_lora(train_cfg):
+            raw_model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         step = int(ckpt["step"])
         if scheduler is not None:
@@ -1316,13 +1628,14 @@ def main() -> None:
 
                 if step % train_cfg.save_every == 0 and is_main_process:
                     save_checkpoint(
-                        output_dir / f"checkpoint_{step:07d}.pt",
+                        _periodic_checkpoint_path(output_dir, step, train_cfg),
                         raw_model,
                         optimizer,
                         scheduler,
                         step,
                         model_cfg,
                         train_cfg,
+                        base_init=base_init,
                     )
                     enforce_periodic_checkpoint_limit(
                         output_dir=output_dir,
@@ -1370,6 +1683,7 @@ def main() -> None:
                             scheduler=scheduler,
                             model_cfg=model_cfg,
                             train_cfg=train_cfg,
+                            base_init=base_init,
                         )
                         if best_path is not None:
                             progress.write(
@@ -1423,6 +1737,7 @@ def main() -> None:
                     scheduler=scheduler,
                     model_cfg=model_cfg,
                     train_cfg=train_cfg,
+                    base_init=base_init,
                 )
                 if best_path is not None:
                     progress.write(
@@ -1434,13 +1749,14 @@ def main() -> None:
 
         if is_main_process:
             save_checkpoint(
-                output_dir / "checkpoint_final.pt",
+                _final_checkpoint_path(output_dir, train_cfg),
                 raw_model,
                 optimizer,
                 scheduler,
                 step,
                 model_cfg,
                 train_cfg,
+                base_init=base_init,
             )
             if wandb_run is not None:
                 wandb_run.summary["train/final_step"] = step
