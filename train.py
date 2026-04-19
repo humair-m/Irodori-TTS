@@ -1120,7 +1120,7 @@ def main() -> None:
     parser.add_argument("--config", default=None, help="YAML config path (model/train overrides)")
     parser.add_argument(
         "--manifest",
-        required=True,
+        required=False,
         help="JSONL manifest with text+latent_path (optional speaker_id for reference sampling).",
     )
     parser.add_argument("--output-dir", default="outputs/irodori_tts")
