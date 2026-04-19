@@ -93,7 +93,7 @@ class PretrainedTextTokenizer:
         tokenizer = AutoTokenizer.from_pretrained(
             repo_id,
             use_fast=True,
-            trust_remote_code=False,
+            trust_remote_code=True,
             local_files_only=local_files_only,
             **kwargs,
         )

@@ -336,6 +336,7 @@ def validate_pretrained_backbone_dim(
     repo_id: str,
     expected_dim: int,
     local_files_only: bool = False,
+    subfolder: str | None = None,
 ) -> int:
     try:
         from transformers import AutoConfig
@@ -345,10 +346,15 @@ def validate_pretrained_backbone_dim(
             "Install with `pip install transformers sentencepiece`."
         ) from exc
 
+    kwargs = {}
+    if subfolder:
+        kwargs["subfolder"] = subfolder
+        
     text_cfg = AutoConfig.from_pretrained(
         repo_id,
-        trust_remote_code=False,
+        trust_remote_code=True,
         local_files_only=local_files_only,
+        **kwargs,
     )
     hidden_size = getattr(text_cfg, "hidden_size", None)
     if hidden_size is None:
@@ -371,6 +377,7 @@ def validate_text_backbone_dim(
         repo_id=model_cfg.text_tokenizer_repo,
         expected_dim=int(model_cfg.text_dim),
         local_files_only=local_files_only,
+        subfolder=model_cfg.text_tokenizer_subfolder,
     )
 
 
