@@ -9,6 +9,9 @@ description = "Irodori-TTS training and inference codebase"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+include = ["irodori_tts*"]
 dependencies = [
     "dacvae",
     "datasets>=3.0.0",
