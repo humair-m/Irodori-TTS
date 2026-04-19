@@ -123,8 +123,7 @@ def save_checkpoint(
             },
             path / LORA_TRAINER_STATE_NAME,
         )
-        except Exception as e:
-            print(f"Warning: Failed to save LoRA state dict locally: {e}")
+
 
     if not train_config_uses_lora(train_cfg):
         path.parent.mkdir(parents=True, exist_ok=True)
