@@ -17,6 +17,7 @@ class ModelConfig:
     dropout: float = 0.0
     text_vocab_size: int = 102400
     text_tokenizer_repo: str = "sbintuitions/sarashina2.2-0.5b"
+    text_tokenizer_subfolder: str | None = None
     text_add_bos: bool = True
     text_dim: int = 1280
     text_layers: int = 14

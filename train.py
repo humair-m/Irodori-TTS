@@ -283,16 +283,18 @@ def _final_checkpoint_path(output_dir: Path, train_cfg: TrainConfig) -> Path:
 
 
 def build_condition_tokenizer(
-    *,
     repo_id: str,
     add_bos: bool,
     vocab_size: int,
+    *,
     local_files_only: bool = False,
+    subfolder: str | None = None,
 ) -> PretrainedTextTokenizer:
     tokenizer = PretrainedTextTokenizer.from_pretrained(
         repo_id=repo_id,
         add_bos=bool(add_bos),
         local_files_only=local_files_only,
+        subfolder=subfolder,
     )
     if tokenizer.vocab_size != vocab_size:
         raise ValueError(
@@ -312,6 +314,7 @@ def build_text_tokenizer(
         add_bos=bool(model_cfg.text_add_bos),
         vocab_size=int(model_cfg.text_vocab_size),
         local_files_only=local_files_only,
+        subfolder=model_cfg.text_tokenizer_subfolder,
     )
 
 

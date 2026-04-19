@@ -3,6 +3,7 @@ model:
   latent_patch_size: 1
   text_vocab_size: 50000
   text_tokenizer_repo: zuhri025/lm_weights_scratch
+  text_tokenizer_subfolder: checkpoint-24000
   model_dim: 768
   num_layers: 16
   num_heads: 12
@@ -29,8 +30,8 @@ train:
   hf_resume_repo: zuhri025/irodori-tts-checkpoints
   tensorboard_enabled: true
   tensorboard_dir: runs/train_500m
-  batch_size: 80
-  gradient_accumulation_steps: 1
+  batch_size: 8
+  gradient_accumulation_steps: 4
   num_workers: 16
   dataloader_persistent_workers: true
   dataloader_prefetch_factor: 4

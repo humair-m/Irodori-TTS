@@ -77,6 +77,7 @@ class PretrainedTextTokenizer:
         repo_id: str,
         add_bos: bool = True,
         local_files_only: bool = False,
+        subfolder: str | None = None,
     ) -> "PretrainedTextTokenizer":
         try:
             from transformers import AutoTokenizer
@@ -86,11 +87,15 @@ class PretrainedTextTokenizer:
                 "Install with `pip install transformers sentencepiece`."
             ) from exc
 
+        kwargs = {}
+        if subfolder:
+            kwargs["subfolder"] = subfolder
         tokenizer = AutoTokenizer.from_pretrained(
             repo_id,
             use_fast=True,
             trust_remote_code=False,
             local_files_only=local_files_only,
+            **kwargs,
         )
         return cls(tokenizer=tokenizer, add_bos=add_bos)
 
