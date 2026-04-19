@@ -1,25 +1,34 @@
 model:
-  latent_dim: 128
+  latent_dim: 32
   latent_patch_size: 1
-  text_vocab_size: 99574
-  text_tokenizer_repo: llm-jp/llm-jp-3-150m
-  model_dim: 1280
-  num_layers: 12
-  num_heads: 20
+  text_vocab_size: 50000
+  text_tokenizer_repo: zuhri025/lm_weights_scratch
+  model_dim: 768
+  num_layers: 16
+  num_heads: 12
   mlp_ratio: 2.875
-  text_mlp_ratio: 2.6
+  text_mlp_ratio: 4.5
   speaker_mlp_ratio: 2.6
   text_dim: 512
-  text_layers: 10
-  text_heads: 8
-  speaker_dim: 768
-  speaker_layers: 8
-  speaker_heads: 12
+  text_layers: 17
+  text_heads: 4
+  speaker_dim: 384
+  speaker_layers: 6
+  speaker_heads: 6
   speaker_patch_size: 1
-  timestep_embed_dim: 512
+  timestep_embed_dim: 256
   adaln_rank: 192
 
 train:
+  hf_dataset: zuhri025/munch-1-latent-NEW-parquet
+  hf_text_col: text
+  hf_latent_col: latent
+  hf_speaker_col: speaker_id
+  hf_filter_max_frames: 712
+  hf_repo_id: zuhri025/irodori-tts-checkpoints
+  hf_resume_repo: zuhri025/irodori-tts-checkpoints
+  tensorboard_enabled: true
+  tensorboard_dir: runs/train_500m
   batch_size: 80
   gradient_accumulation_steps: 1
   num_workers: 16
@@ -37,14 +46,14 @@ train:
   stable_steps: 44000
   min_lr_scale: 0.01
   max_steps: 50000
-  max_text_len: 256
+  max_text_len: 2048
   text_condition_dropout: 0.1
   speaker_condition_dropout: 0.1
   timestep_stratified: true
   max_latent_steps: 750
   fixed_target_latent_steps: 750
   fixed_target_full_mask: true
-  log_every: 100
+  log_every: 10
   save_every: 1000
   wandb_enabled: false
   wandb_project:

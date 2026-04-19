@@ -109,6 +109,15 @@ class ModelConfig:
 @dataclass
 class TrainConfig:
     manifest_path: str = ""
+    hf_dataset: str | None = None
+    hf_dataset_split: str = "train"
+    hf_text_col: str = "text"
+    hf_latent_col: str = "latent"
+    hf_latent_dim_col: str = "latent_dim"
+    hf_num_frames_col: str = "num_frames"
+    hf_speaker_col: str = "speaker_id"
+    hf_duration_col: str = "duration"
+    hf_filter_max_frames: int | None = None
     output_dir: str = "outputs"
     batch_size: int = 8
     num_workers: int = 2
@@ -159,6 +168,10 @@ class TrainConfig:
     wandb_entity: str | None = None
     wandb_run_name: str | None = None
     wandb_mode: str = "online"
+    tensorboard_enabled: bool = False
+    tensorboard_dir: str = "runs"
+    hf_repo_id: str | None = None
+    hf_resume_repo: str | None = None
     ddp_find_unused_parameters: bool = False
     lora_enabled: bool = False
     lora_r: int = 16

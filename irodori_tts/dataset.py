@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
@@ -234,6 +235,107 @@ class _ManifestIndex:
             has_caption=has_caption,
             caption_key=str(caption_key),
         )
+
+
+class HuggingFaceLatentDataset(Dataset):
+    def __init__(
+        self,
+        hf_dataset_path: str,
+        split: str,
+        latent_dim: int,
+        max_latent_steps: int | None = None,
+        subset_indices: list[int] | None = None,
+        enable_caption_condition: bool = False,
+        enable_speaker_condition: bool = True,
+        caption_key: str = "caption",
+        hf_text_col: str = "text",
+        hf_latent_col: str = "latent",
+        hf_latent_dim_col: str = "latent_dim",
+        hf_num_frames_col: str = "num_frames",
+        hf_speaker_col: str = "speaker_id",
+        hf_filter_max_frames: int | None = None,
+        show_manifest_progress: bool = False,
+    ):
+        from datasets import load_dataset
+        self.latent_dim = latent_dim
+        self.max_latent_steps = max_latent_steps
+        self.enable_caption_condition = bool(enable_caption_condition)
+        self.enable_speaker_condition = bool(enable_speaker_condition)
+        self.caption_key = str(caption_key)
+        
+        self.hf_text_col = hf_text_col
+        self.hf_latent_col = hf_latent_col
+        self.hf_latent_dim_col = hf_latent_dim_col
+        self.hf_num_frames_col = hf_num_frames_col
+        self.hf_speaker_col = hf_speaker_col
+
+        ds = load_dataset(hf_dataset_path, split=split)
+        
+        if hf_filter_max_frames is not None:
+            if show_manifest_progress:
+                print(f"Filtering dataset: max_frames <= {hf_filter_max_frames}")
+            ds = ds.filter(lambda x: x[hf_num_frames_col] <= hf_filter_max_frames, desc="Filtering max frames")
+
+        self.ds = ds
+        self.sample_indices = subset_indices if subset_indices is not None else list(range(len(self.ds)))
+
+        self.speaker_to_indices: dict[str, list[int]] = {}
+        for local_index, sample_index in enumerate(self.sample_indices):
+            if self.enable_speaker_condition:
+                speaker_id = self.ds[sample_index].get(self.hf_speaker_col)
+                if speaker_id is not None:
+                    self.speaker_to_indices.setdefault(str(speaker_id), []).append(local_index)
+
+        if not self.sample_indices:
+            raise ValueError(f"No valid samples in huggingface dataset: {hf_dataset_path}")
+
+    def __len__(self) -> int:
+        return len(self.sample_indices)
+
+    def _parse_latent(self, raw_binary: bytes, num_frames: int, dim: int) -> torch.Tensor:
+        arr = np.frombuffer(raw_binary, dtype=np.float32).reshape(num_frames, dim).copy()
+        latent = torch.from_numpy(arr)
+        latent = _coerce_latent_shape(latent, self.latent_dim).float()
+        if self.max_latent_steps is not None:
+            latent = latent[: self.max_latent_steps]
+        return latent
+
+    def _get_item_data(self, local_index: int):
+        sample_index = self.sample_indices[local_index]
+        row = self.ds[sample_index]
+        latent = self._parse_latent(row[self.hf_latent_col], row[self.hf_num_frames_col], row[self.hf_latent_dim_col])
+        return row, latent
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        row, latent = self._get_item_data(index)
+
+        ref_index = index
+        has_speaker = False
+        if self.enable_speaker_condition:
+            speaker_id = row.get(self.hf_speaker_col)
+            if speaker_id is not None:
+                candidates = self.speaker_to_indices.get(str(speaker_id), [])
+                if len(candidates) > 1:
+                    alternatives = [i for i in candidates if i != index]
+                    if alternatives:
+                        ref_index = random.choice(alternatives)
+                        has_speaker = True
+
+        if ref_index == index:
+            ref_latent = latent
+        else:
+            _, ref_latent = self._get_item_data(ref_index)
+
+        return {
+            "text": row[self.hf_text_col],
+            "caption": str(row.get(self.caption_key, "")) if self.enable_caption_condition else "",
+            "has_caption": bool(str(row.get(self.caption_key, "")).strip())
+            if self.enable_caption_condition
+            else False,
+            "latent": latent,
+            "ref_latent": ref_latent,
+            "has_speaker": has_speaker,
+        }
 
 
 @dataclass

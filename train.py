@@ -24,7 +24,7 @@ from irodori_tts.config import (
     load_experiment_yaml,
     merge_dataclass_overrides,
 )
-from irodori_tts.dataset import LatentTextDataset, TTSCollator
+from irodori_tts.dataset import LatentTextDataset, HuggingFaceLatentDataset, TTSCollator
 from irodori_tts.lora import (
     LORA_METADATA_NAME,
     LORA_TARGET_PRESETS,
@@ -123,20 +123,38 @@ def save_checkpoint(
             },
             path / LORA_TRAINER_STATE_NAME,
         )
-        return
+        except Exception as e:
+            print(f"Warning: Failed to save LoRA state dict locally: {e}")
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "step": step,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": None if scheduler is None else scheduler.state_dict(),
-            "model_config": asdict(model_cfg),
-            "train_config": asdict(train_cfg),
-        },
-        path,
-    )
+    if not train_config_uses_lora(train_cfg):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "step": step,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": None if scheduler is None else scheduler.state_dict(),
+                "model_config": asdict(model_cfg),
+                "train_config": asdict(train_cfg),
+            },
+            path,
+        )
+
+    hf_token = os.environ.get("HF_TOKEN_WRITE")
+    if train_cfg.hf_repo_id and hf_token:
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi(token=hf_token)
+            api.create_repo(repo_id=train_cfg.hf_repo_id, exist_ok=True)
+            print(f"Pushing checkpoint to HF repo: {train_cfg.hf_repo_id}...")
+            upload_dir = path if train_config_uses_lora(train_cfg) else path.parent
+            api.upload_folder(
+                folder_path=str(upload_dir),
+                repo_id=train_cfg.hf_repo_id,
+                commit_message=f"Irodori-TTS checkpoint upload step {step}",
+            )
+        except Exception as e:
+            print(f"Failed pushing checkpoint to huggingface: {e}")
 
 
 def _safe_unlink(path: Path) -> None:
@@ -1493,6 +1511,27 @@ def main() -> None:
     if cli_provided(raw_argv, "--seed"):
         train_cfg = replace(train_cfg, seed=args.seed)
 
+    if train_cfg.hf_resume_repo is not None:
+        try:
+            from huggingface_hub import snapshot_download
+            hf_token = os.environ.get("HF_TOKEN_WRITE")
+            if is_main_process:
+                print(f"Syncing resume checkpoint from HF: {train_cfg.hf_resume_repo}")
+            download_dir = snapshot_download(repo_id=train_cfg.hf_resume_repo, token=hf_token)
+            download_path = Path(download_dir)
+            ckpts = list_periodic_checkpoints(download_path)
+            if ckpts:
+                args.resume = str(ckpts[0][1])
+            else:
+                best_ckpts = list_best_val_loss_checkpoints(download_path)
+                if best_ckpts:
+                    args.resume = str(best_ckpts[-1][2])
+            if is_main_process and args.resume:
+                print(f"Set resume auto-path to {args.resume} from HF sync")
+        except Exception as e:
+            if is_main_process:
+                print(f"Warning: HF Resume Sync failed: {e}")
+
     resume_path = Path(args.resume).expanduser() if args.resume is not None else None
     resume_train_cfg = None
     resume_base_init = None
@@ -1604,6 +1643,14 @@ def main() -> None:
     if is_main_process and distributed:
         print(f"DDP enabled: world_size={world_size} (local_rank={local_rank})")
     wandb_run = None
+    tb_writer = None
+    if train_cfg.tensorboard_enabled and is_main_process:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            tb_writer = SummaryWriter(log_dir=train_cfg.tensorboard_dir)
+            print(f"TensorBoard logging enabled in {train_cfg.tensorboard_dir}")
+        except ImportError:
+            print("Warning: tensorboard not installed. Run `pip install tensorboard` to use it.")
     if train_cfg.wandb_enabled and is_main_process:
         try:
             import wandb
@@ -1681,15 +1728,35 @@ def main() -> None:
                 f"Caption tokenizer={model_cfg.caption_tokenizer_repo_resolved} vocab={caption_tokenizer.vocab_size} add_bos={model_cfg.caption_add_bos_resolved} padding_side=right "
                 f"(pretrained hidden_size={caption_hidden_size})."
             )
-    full_dataset = LatentTextDataset(
-        manifest_path=train_cfg.manifest_path,
-        latent_dim=model_cfg.latent_dim,
-        max_latent_steps=train_cfg.max_latent_steps,
-        enable_caption_condition=model_cfg.use_caption_condition,
-        enable_speaker_condition=model_cfg.use_speaker_condition,
-        show_manifest_progress=bool(train_cfg.progress and is_main_process),
-        manifest_progress_desc="Index Manifest",
-    )
+    if train_cfg.hf_dataset:
+        def build_dataset(is_full=False, indices=None):
+            return HuggingFaceLatentDataset(
+                hf_dataset_path=train_cfg.hf_dataset,
+                split=train_cfg.hf_dataset_split,
+                latent_dim=model_cfg.latent_dim,
+                max_latent_steps=train_cfg.max_latent_steps,
+                subset_indices=indices,
+                enable_caption_condition=model_cfg.use_caption_condition,
+                enable_speaker_condition=model_cfg.use_speaker_condition,
+                hf_text_col=train_cfg.hf_text_col,
+                hf_latent_col=train_cfg.hf_latent_col,
+                hf_latent_dim_col=train_cfg.hf_latent_dim_col,
+                hf_num_frames_col=train_cfg.hf_num_frames_col,
+                hf_speaker_col=train_cfg.hf_speaker_col,
+                hf_filter_max_frames=train_cfg.hf_filter_max_frames,
+                show_manifest_progress=bool(train_cfg.progress and is_main_process and is_full),
+            )
+        full_dataset = build_dataset(is_full=True)
+    else:
+        full_dataset = LatentTextDataset(
+            manifest_path=train_cfg.manifest_path,
+            latent_dim=model_cfg.latent_dim,
+            max_latent_steps=train_cfg.max_latent_steps,
+            enable_caption_condition=model_cfg.use_caption_condition,
+            enable_speaker_condition=model_cfg.use_speaker_condition,
+            show_manifest_progress=bool(train_cfg.progress and is_main_process),
+            manifest_progress_desc="Index Manifest",
+        )
     train_dataset = full_dataset
     valid_dataset = None
     if train_cfg.valid_ratio > 0.0:
@@ -1698,24 +1765,28 @@ def main() -> None:
             valid_ratio=train_cfg.valid_ratio,
             seed=train_cfg.seed,
         )
-        train_dataset = LatentTextDataset(
-            manifest_path=train_cfg.manifest_path,
-            latent_dim=model_cfg.latent_dim,
-            max_latent_steps=train_cfg.max_latent_steps,
-            subset_indices=train_indices,
-            enable_caption_condition=model_cfg.use_caption_condition,
-            enable_speaker_condition=model_cfg.use_speaker_condition,
-            manifest_index=full_dataset.manifest_index,
-        )
-        valid_dataset = LatentTextDataset(
-            manifest_path=train_cfg.manifest_path,
-            latent_dim=model_cfg.latent_dim,
-            max_latent_steps=train_cfg.max_latent_steps,
-            subset_indices=valid_indices,
-            enable_caption_condition=model_cfg.use_caption_condition,
-            enable_speaker_condition=model_cfg.use_speaker_condition,
-            manifest_index=full_dataset.manifest_index,
-        )
+        if train_cfg.hf_dataset:
+            train_dataset = build_dataset(indices=train_indices)
+            valid_dataset = build_dataset(indices=valid_indices)
+        else:
+            train_dataset = LatentTextDataset(
+                manifest_path=train_cfg.manifest_path,
+                latent_dim=model_cfg.latent_dim,
+                max_latent_steps=train_cfg.max_latent_steps,
+                subset_indices=train_indices,
+                enable_caption_condition=model_cfg.use_caption_condition,
+                enable_speaker_condition=model_cfg.use_speaker_condition,
+                manifest_index=full_dataset.manifest_index,
+            )
+            valid_dataset = LatentTextDataset(
+                manifest_path=train_cfg.manifest_path,
+                latent_dim=model_cfg.latent_dim,
+                max_latent_steps=train_cfg.max_latent_steps,
+                subset_indices=valid_indices,
+                enable_caption_condition=model_cfg.use_caption_condition,
+                enable_speaker_condition=model_cfg.use_speaker_condition,
+                manifest_index=full_dataset.manifest_index,
+            )
         if is_main_process:
             print(
                 f"Validation split enabled: train={len(train_dataset)} valid={len(valid_dataset)} (ratio={train_cfg.valid_ratio:.4f}, valid_every={train_cfg.valid_every} steps)."
@@ -2176,12 +2247,15 @@ def main() -> None:
                         progress.write(
                             f"step={step} loss={loss_value:.6f} rf={rf_loss_value:.6f} lr={lr_value:.3e}"
                         )
+                        metrics = {
+                            "train/loss": loss_value,
+                            "train/rf_loss": rf_loss_value,
+                            "train/lr": lr_value,
+                        }
+                        if tb_writer is not None:
+                            for k, v in metrics.items():
+                                tb_writer.add_scalar(k, v, step)
                         if wandb_run is not None:
-                            metrics = {
-                                "train/loss": loss_value,
-                                "train/rf_loss": rf_loss_value,
-                                "train/lr": lr_value,
-                            }
                             wandb_run.log(metrics, step=step)
 
                 if step % train_cfg.save_every == 0 and is_main_process:
@@ -2222,6 +2296,9 @@ def main() -> None:
                                 valid_metrics["num_samples"],
                             )
                         )
+                        if tb_writer is not None:
+                            tb_writer.add_scalar("valid/loss", valid_metrics["loss"], step)
+                            tb_writer.add_scalar("valid/rf_loss", valid_metrics["rf_loss"], step)
                         if wandb_run is not None:
                             wandb_run.log(
                                 {
@@ -2276,6 +2353,8 @@ def main() -> None:
                         valid_metrics["num_samples"],
                     )
                 )
+                if tb_writer is not None:
+                    tb_writer.add_scalar("valid/final_target_loss", valid_loss, step)
                 if wandb_run is not None:
                     wandb_run.log(
                         {
