@@ -30,7 +30,7 @@ train:
   hf_resume_repo: zuhri025/irodori-tts-checkpoints
   tensorboard_enabled: true
   tensorboard_dir: runs/train_500m
-  batch_size: 8
+  batch_size: 4
   gradient_accumulation_steps: 4
   num_workers: 16
   dataloader_persistent_workers: true
